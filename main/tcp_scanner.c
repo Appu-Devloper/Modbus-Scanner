@@ -1,0 +1,391 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
+#include "scanner_config.h"
+#include "esp_eth.h"
+#include "esp_wifi.h"
+#include "esp_hosted.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "tcp_scanner.h"
+#include "tcp_config.h"
+#include "modbus_tcp.h"
+
+static const struct {
+    const char *ip_prefix,*last_octets,*custom_ports;
+    bool use_common_port;
+    int timeout_ms;
+} tcp_config={TCP_IP_PREFIX,TCP_LAST_OCTETS,TCP_CUSTOM_PORTS,TCP_USE_COMMON_PORT,TCP_TIMEOUT_MS};
+static atomic_bool *busy,*cancel;
+static atomic_bool network_ready;
+static atomic_bool wifi_ready;
+static atomic_bool wifi_started;
+static bool any_network_ready(void) {
+    return atomic_load(&network_ready) || atomic_load(&wifi_ready);
+}
+static atomic_bool link_up;
+static atomic_bool ethernet_static;
+static char static_scan_prefix[13];
+static int64_t dhcp_deadline;
+ESP_EVENT_DEFINE_BASE(SCANNER_NETWORK_EVENT);
+static bool ethernet_started, ethernet_attempted;
+static esp_netif_t *netif,*wifi_netif;
+static atomic_uint network_revision;
+static atomic_int preferred_network; // 0: unavailable, 1: Ethernet, 2: Wi-Fi
+// Called only from the serialized event loop, after readiness changes.
+static void select_network(void) {
+    int selected=atomic_load(&network_ready)?1:(atomic_load(&wifi_ready)?2:0);
+    if(selected) {
+        esp_err_t err=esp_netif_set_default_netif(selected==1?netif:wifi_netif);
+        if(err!=ESP_OK) printf("Default network selection failed: %s\n",esp_err_to_name(err));
+    }
+    if(atomic_exchange(&preferred_network,selected)!=selected) {
+        atomic_fetch_add(&network_revision,1);
+        puts(selected==1?"Active network: Ethernet. TCP connections will use Ethernet.":
+            selected==2?"Active network: Wi-Fi fallback.":"No network IP; TCP scan will wait.");
+    }
+}
+static uint16_t transaction;
+typedef struct {int id,last_id,fc,start,end,count,step; bool scan; char ip[16];int port;} tcp_job_t;
+static tcp_job_t job;
+static void static_fallback_event(void *arg,esp_event_base_t base,int32_t id,void *data) {
+    (void)arg;(void)base;(void)id;(void)data;
+    if(!ETH_STATIC_FALLBACK_ENABLED || !atomic_load(&link_up) ||
+       atomic_load(&network_ready) || !dhcp_deadline || esp_timer_get_time()<dhcp_deadline) return;
+    esp_netif_ip_info_t info={0};
+    // A DHCP lease may be ready while its GOT_IP event is still queued.
+    if(esp_netif_get_ip_info(netif,&info)==ESP_OK && info.ip.addr!=0) return;
+    if(esp_netif_str_to_ip4(ETH_STATIC_IP,&info.ip)!=ESP_OK ||
+       esp_netif_str_to_ip4(ETH_STATIC_NETMASK,&info.netmask)!=ESP_OK ||
+       esp_netif_str_to_ip4(ETH_STATIC_GATEWAY,&info.gw)!=ESP_OK) {
+        puts("Invalid Ethernet static IP settings.");dhcp_deadline=0;return;
+    }
+    esp_err_t err=esp_netif_dhcpc_stop(netif);
+    if(err==ESP_OK || err==ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        err=esp_netif_set_ip_info(netif,&info);
+        if(err==ESP_OK) {
+            atomic_store(&ethernet_static,true);
+            atomic_store(&network_ready,true);
+            printf("DHCP timed out; Ethernet static IP: %s, mask: %s, gateway: %s\n",
+                ETH_STATIC_IP,ETH_STATIC_NETMASK,ETH_STATIC_GATEWAY);
+            select_network();dhcp_deadline=0;return;
+        }
+        esp_netif_dhcpc_start(netif);
+    }
+    printf("Ethernet static fallback failed: %s; retrying later.\n",esp_err_to_name(err));
+    dhcp_deadline=esp_timer_get_time()+ETH_DHCP_TIMEOUT_SECONDS*1000000LL;
+}
+static void network_event(void *arg,esp_event_base_t base,int32_t id,void *data) {
+    (void)arg;
+    if(base==IP_EVENT && id==IP_EVENT_ETH_GOT_IP) {
+        if(!atomic_load(&link_up)) return;
+        ip_event_got_ip_t *e=data;
+        printf("Ethernet IP: " IPSTR ", netmask: " IPSTR ", gateway: " IPSTR "\n",
+            IP2STR(&e->ip_info.ip),IP2STR(&e->ip_info.netmask),IP2STR(&e->ip_info.gw));
+        atomic_store(&network_ready,true);
+    } else if(base==ETH_EVENT && id==ETHERNET_EVENT_CONNECTED) {
+        atomic_store(&link_up,true);
+        dhcp_deadline=esp_timer_get_time()+ETH_DHCP_TIMEOUT_SECONDS*1000000LL;
+        puts("Ethernet link UP; waiting for DHCP address.");
+    } else if(base==ETH_EVENT && (id==ETHERNET_EVENT_DISCONNECTED || id==ETHERNET_EVENT_STOP)) {
+        atomic_store(&link_up,false);atomic_store(&network_ready,false);
+        dhcp_deadline=0;
+        if(atomic_exchange(&ethernet_static,false)) {
+            esp_netif_ip_info_t empty={0};
+            ESP_ERROR_CHECK(esp_netif_set_ip_info(netif,&empty));
+            ESP_ERROR_CHECK(esp_netif_dhcpc_start(netif));
+        }
+        puts(id==ETHERNET_EVENT_STOP?"Ethernet stopped.":"Ethernet link DOWN.");
+    } else if(base==IP_EVENT && id==IP_EVENT_ETH_LOST_IP) {
+        atomic_store(&network_ready,false);
+        dhcp_deadline=esp_timer_get_time()+ETH_DHCP_TIMEOUT_SECONDS*1000000LL;
+        puts("Ethernet IP address lost; waiting for a new DHCP address.");
+    }
+    select_network();
+}
+static int start_ethernet(void) {
+    if(ethernet_started) {puts(atomic_load(&network_ready)?"Ethernet ready":"Waiting for link/DHCP");return 0;}
+    if(ethernet_attempted) {puts("Ethernet initialization failed; check board/PHY configuration and reset to retry.");return 1;}
+    ethernet_attempted=true;
+    ESP_ERROR_CHECK(esp_netif_init());ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_inherent_config_t eth_base=ESP_NETIF_INHERENT_DEFAULT_ETH();
+    eth_base.route_prio=150; // Prefer Ethernet over the default Wi-Fi station (100).
+    esp_netif_config_t cfg=ESP_NETIF_DEFAULT_ETH();cfg.base=&eth_base;netif=esp_netif_new(&cfg);
+    if(!netif) {puts("Cannot allocate network interface; reset and retry.");return 1;}
+    eth_mac_config_t mc=ETH_MAC_DEFAULT_CONFIG();
+    eth_esp32_emac_config_t emac=ETH_ESP32_EMAC_DEFAULT_CONFIG();
+    eth_phy_config_t pc=ETH_PHY_DEFAULT_CONFIG();pc.phy_addr=1;pc.reset_gpio_num=51;
+    esp_eth_mac_t *mac=esp_eth_mac_new_esp32(&emac,&mc);
+    esp_eth_phy_t *phy=esp_eth_phy_new_ip101(&pc);
+    if(!mac || !phy) {puts("Cannot allocate Ethernet driver; reset and retry.");return 1;}
+    esp_eth_config_t ec=ETH_DEFAULT_CONFIG(mac,phy);esp_eth_handle_t handle=NULL;
+    esp_err_t result=esp_eth_driver_install(&ec,&handle);
+    if(result!=ESP_OK) {
+        printf("Ethernet initialization failed: %s. Verify Nano PHY wiring and reset to retry.\n",esp_err_to_name(result));
+        mac->del(mac);phy->del(phy);esp_netif_destroy(netif);netif=NULL;
+        return 1;
+    }
+    ESP_ERROR_CHECK(esp_netif_attach(netif,esp_eth_new_netif_glue(handle)));
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT,ESP_EVENT_ANY_ID,network_event,NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,IP_EVENT_ETH_GOT_IP,network_event,NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,IP_EVENT_ETH_LOST_IP,network_event,NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(SCANNER_NETWORK_EVENT,ESP_EVENT_ANY_ID,static_fallback_event,NULL));
+    ESP_ERROR_CHECK(esp_eth_start(handle));ethernet_started=true;
+    puts("Ethernet started (Nano IP101, MDC31 MDIO52 RESET51, PHY1); waiting for DHCP.");return 0;
+}
+static void wifi_event(void *arg,esp_event_base_t base,int32_t id,void *data) {
+    (void)arg;
+    if(base==WIFI_EVENT && id==WIFI_EVENT_STA_START) {
+        esp_err_t err=esp_wifi_connect();
+        if(err!=ESP_OK) printf("Wi-Fi connect failed: %s\n",esp_err_to_name(err));
+    } else if(base==WIFI_EVENT && id==WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *e=data;
+        atomic_store(&wifi_ready,false);
+        printf("Wi-Fi disconnected (reason %u); reconnecting...\n",e->reason);
+        esp_err_t err=esp_wifi_connect();
+        if(err!=ESP_OK) printf("Wi-Fi reconnect failed: %s\n",esp_err_to_name(err));
+    } else if(base==IP_EVENT && id==IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e=data;
+        printf("Wi-Fi IP: " IPSTR ", netmask: " IPSTR ", gateway: " IPSTR "\n",
+            IP2STR(&e->ip_info.ip),IP2STR(&e->ip_info.netmask),IP2STR(&e->ip_info.gw));
+        atomic_store(&wifi_ready,true);
+    } else if(base==IP_EVENT && id==IP_EVENT_STA_LOST_IP) {
+        atomic_store(&wifi_ready,false);
+        puts("Wi-Fi IP address lost; waiting for DHCP.");
+    }
+    select_network();
+}
+static esp_err_t start_wifi(void) {
+    printf("Starting Wi-Fi fallback: %s\n",WIFI_SSID);
+    esp_err_t err=nvs_flash_init();
+    if(err!=ESP_OK) return err;
+    if(esp_hosted_init()!=0 || esp_hosted_connect_to_slave()!=0) return ESP_FAIL;
+    wifi_netif=esp_netif_create_default_wifi_sta();
+    if(!wifi_netif) return ESP_ERR_NO_MEM;
+    wifi_init_config_t init=WIFI_INIT_CONFIG_DEFAULT();
+    err=esp_wifi_init(&init);if(err!=ESP_OK) return err;
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT,ESP_EVENT_ANY_ID,wifi_event,NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,IP_EVENT_STA_GOT_IP,wifi_event,NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,IP_EVENT_STA_LOST_IP,wifi_event,NULL));
+    wifi_config_t config={.sta={.ssid=WIFI_SSID,.password=WIFI_PASSWORD}};
+    err=esp_wifi_set_storage(WIFI_STORAGE_RAM);if(err!=ESP_OK) return err;
+    err=esp_wifi_set_mode(WIFI_MODE_STA);if(err!=ESP_OK) return err;
+    err=esp_wifi_set_config(WIFI_IF_STA,&config);if(err!=ESP_OK) return err;
+    err=esp_wifi_start();if(err==ESP_OK) atomic_store(&wifi_started,true);
+    return err;
+}
+static void network_monitor(void *unused) {
+    (void)unused;
+    unsigned unavailable=0;
+    bool attempted=false;
+    for(;;) {
+        if(ethernet_started) esp_event_post(SCANNER_NETWORK_EVENT,0,NULL,0,0);
+        if(atomic_load(&network_ready)) unavailable=0;
+        else if(unavailable<WIFI_FALLBACK_DELAY_SECONDS) unavailable++;
+        if(WIFI_FALLBACK_ENABLED && !attempted && unavailable>=WIFI_FALLBACK_DELAY_SECONDS) {
+            attempted=true;
+            esp_err_t err=start_wifi();
+            if(err!=ESP_OK)
+                printf("Wi-Fi initialization failed: %s. Check C6 ESP-Hosted firmware; reset to retry. Ethernet remains available.\n",esp_err_to_name(err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+static int wait_socket(int fd,bool write_ready,int64_t deadline) {
+    while(!atomic_load(cancel) && esp_timer_get_time()<deadline) {
+        fd_set fds;FD_ZERO(&fds);FD_SET(fd,&fds);
+        int64_t left=deadline-esp_timer_get_time();if(left<=0) break;
+        struct timeval tv={.tv_sec=0,.tv_usec=left<50000?left:50000};
+        int r=select(fd+1,write_ready?NULL:&fds,write_ready?&fds:NULL,NULL,&tv);
+        if(r>0) return 1;
+        if(r<0 && errno!=EINTR) break;
+    }
+    return 0;
+}
+static int connect_peer(const char *ip,int port,int *socket_network) {
+    while(!atomic_load(&preferred_network) && !atomic_load(cancel)) vTaskDelay(pdMS_TO_TICKS(250));
+    if(atomic_load(cancel)) return -1;
+    struct sockaddr_in address={.sin_family=AF_INET,.sin_port=htons(port)};
+    if(inet_pton(AF_INET,ip,&address.sin_addr)!=1) return -1;
+    int fd=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);if(fd<0) return -1;
+    *socket_network=atomic_load(&preferred_network);
+    esp_netif_t *selected=*socket_network==1?netif:wifi_netif;
+    struct ifreq iface={0};
+    if(!selected || !*socket_network || esp_netif_get_netif_impl_name(selected,iface.ifr_name)!=ESP_OK ||
+       setsockopt(fd,SOL_SOCKET,SO_BINDTODEVICE,&iface,sizeof(iface))<0) {
+        puts("Cannot bind TCP socket to selected network.");close(fd);return -1;
+    }
+    if(fcntl(fd,F_SETFL,O_NONBLOCK)<0) {close(fd);return -1;}
+    int r=connect(fd,(struct sockaddr *)&address,sizeof(address));
+    if(r<0) {
+        if(errno!=EINPROGRESS || !wait_socket(fd,true,esp_timer_get_time()+tcp_config.timeout_ms*1000LL)) {close(fd);return -1;}
+        int err=0;socklen_t len=sizeof(err);
+        if(getsockopt(fd,SOL_SOCKET,SO_ERROR,&err,&len)<0 || err) {close(fd);return -1;}
+    }
+    return fd;
+}
+static bool transfer(int fd,uint8_t *p,size_t n,bool sending,int64_t deadline) {
+    while(n && !atomic_load(cancel)) {
+        if(!wait_socket(fd,sending,deadline)) return false;
+        int r=sending?send(fd,p,n,0):recv(fd,p,n,0);
+        if(r<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR)) continue;
+        if(r<=0) return false;
+        p+=r;n-=r;
+    }
+    return n==0;
+}
+static int exchange(int fd,int id,int start,uint8_t *rx) {
+    uint8_t tx[12];uint16_t tid=++transaction;
+    if(!mb_tcp_request(tx,tid,id,job.fc,start,job.count)) return 0;
+    int64_t deadline=esp_timer_get_time()+tcp_config.timeout_ms*1000LL;
+    if(!transfer(fd,tx,12,true,deadline) || !transfer(fd,rx,6,false,deadline)) return 0;
+    size_t len=((size_t)rx[4]<<8)|rx[5];
+    if(len<3 || len>254 || !transfer(fd,rx+6,len,false,deadline)) return 0;
+    return mb_tcp_response(rx,len+6,tid,id,job.fc,job.count);
+}
+static void report(const char *ip,int port,int id,int start,int r,uint8_t *rx) {
+    printf("%s | IP %s | Port %d | Unit ID %d | FC%02d | Register offset %d | Count %d",
+        r==1?"READ OK":"MODBUS EXCEPTION",ip,port,id,job.fc,start,job.count);
+    if(r==2) printf(" | Exception code %u (device responded, requested data unavailable)",rx[8]);
+    else for(int i=0;i<job.count;i++) printf(i==0?" | Values: %u":", %u",job.fc<3?(rx[9+i/8]>>(i%8))&1:((unsigned)rx[9+2*i]<<8)|rx[10+2*i]);
+    puts("");
+}
+static void worker(void *arg) {
+    (void)arg;uint8_t rx[260];
+scan_again:
+    while(!atomic_load(&preferred_network) && !atomic_load(cancel)) vTaskDelay(pdMS_TO_TICKS(250));
+    if(atomic_load(cancel)) {atomic_store(busy,false);vTaskDelete(NULL);return;}
+    unsigned revision=atomic_load(&network_revision);
+    unsigned matches=0,probes=0,endpoints=0,unit_responses=0,checked=0;
+    int64_t scan_started=esp_timer_get_time();
+    atomic_store(busy,true);
+    int octets[254],ports[32];
+    int no=tcp_parse_list(tcp_config.last_octets,1,254,octets,254);
+    int np=tcp_config.use_common_port?(ports[0]=502,1):tcp_parse_list(tcp_config.custom_ports,1,65535,ports,32);
+    if(!job.scan) {no=np=1;ports[0]=job.port;}
+    for(int o=0;o<no && !atomic_load(cancel);o++) for(int p=0;p<np && !atomic_load(cancel);p++) {
+        if(revision!=atomic_load(&network_revision)) goto scan_again;
+        const char *prefix=atomic_load(&preferred_network)==1 && atomic_load(&ethernet_static)?
+            static_scan_prefix:tcp_config.ip_prefix;
+        char ip[16];if(job.scan) snprintf(ip,sizeof(ip),"%s%d",prefix,octets[o]);else strcpy(ip,job.ip);
+        checked++;
+        if(checked==1 || checked%10==0)
+            printf("Scan progress: checking endpoint %u/%d | %u Modbus endpoints found\n",checked,no*np,endpoints);
+        int socket_network=0;
+        int fd=connect_peer(ip,ports[p],&socket_network);
+        if(fd<0) continue;
+        printf("Port open: %s:%d | Checking unit IDs %d–%d...\n",ip,ports[p],job.id,job.last_id);
+        bool responding_ids[256]={0};
+        unsigned endpoint_replies=0;
+        for(int id=job.id;id<=job.last_id && !atomic_load(cancel);id++) {
+            for(int a=job.start;a<=job.end && !atomic_load(cancel);a+=job.step) {
+                if(revision!=atomic_load(&network_revision)) {
+                    if(fd>=0) close(fd);
+                    puts("Network changed; restarting target scan on the selected network.");
+                    goto scan_again;
+                }
+                if(fd>=0 && socket_network!=atomic_load(&preferred_network)) {
+                    close(fd);fd=-1;
+                    puts("Network changed; reconnecting Modbus TCP on the preferred interface.");
+                }
+                if(fd<0) fd=connect_peer(ip,ports[p],&socket_network);
+                if(fd<0) break;
+                int r=exchange(fd,id,a,rx);probes++;
+                if(r) {report(ip,ports[p],id,a,r,rx);matches++;endpoint_replies++;responding_ids[id]=true;}
+                else {close(fd);fd=-1;if(!job.scan) printf("TCP_NO_RESPONSE,%s,%d,%d,%d\n",ip,ports[p],id,a);}
+                if(probes%100==0) printf("TCP progress: %u requests\n",probes);
+            }
+        }
+        if(fd>=0) close(fd);
+        if(endpoint_replies) {
+            endpoints++;
+            printf("FOUND | %s:%d | Responding unit IDs: ",ip,ports[p]);
+            bool first=true;
+            for(int id=job.id;id<=job.last_id;id++) {
+                if(!responding_ids[id]) continue;
+                int last=id;
+                while(last<job.last_id && responding_ids[last+1]) last++;
+                printf(first?"%d":", %d",id);
+                if(last>id) printf("–%d",last);
+                unit_responses+=(unsigned)(last-id+1);id=last;first=false;
+            }
+            puts("\nResponding IDs do not necessarily represent separate physical devices.");
+        } else puts("Port was open, but no valid Modbus reply was received for the configured reads.");
+    }
+    printf("\nSCAN %s | %u Modbus endpoints | %u responding IP/port/unit combinations | %.1f seconds\n",
+        atomic_load(cancel)?"STOPPED":"COMPLETE",endpoints,unit_responses,
+        (esp_timer_get_time()-scan_started)/1000000.0);
+    if(!matches) puts("No Modbus replies found. Check device power, target subnet, TCP port, and supported register/function.");
+    puts("No reply to this read does not prove that a device is absent.");
+    printf("TCP %s: %u requests, %u validated responses\n",atomic_load(cancel)?"stopped":"done",probes,matches);
+    atomic_store(busy,false);
+    while(!atomic_load(cancel) && revision==atomic_load(&network_revision)) vTaskDelay(pdMS_TO_TICKS(250));
+    if(!atomic_load(cancel)) goto scan_again;
+    vTaskDelete(NULL);
+}
+static void automatic_scan(void *unused) {
+    (void)unused;
+    unsigned waits=0;
+    while(!any_network_ready()) {
+        if(waits++%10==0) {
+            if(atomic_load(&wifi_started)) puts("Waiting for Wi-Fi connection/DHCP or Ethernet IP...");
+            else if(atomic_load(&link_up))
+                puts("Ethernet link is UP, but no DHCP address. Waiting for DHCP or configured static fallback.");
+            else
+                puts("Waiting for Ethernet link: check RJ45 cable, powered switch/device, and link LEDs.");
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    puts("Network ready. Starting configured TCP scan.");
+    worker(NULL); // Scans again whenever the selected network changes.
+}
+void tcp_scanner_start(atomic_bool *b,atomic_bool *c) {
+    busy=b;cancel=c;
+    if(ETH_STATIC_FALLBACK_ENABLED) {
+        esp_netif_ip_info_t info={0};
+        const char *last_dot=strrchr(ETH_STATIC_IP,'.');
+        size_t prefix_len=last_dot?(size_t)(last_dot-ETH_STATIC_IP)+1:0;
+        if(!prefix_len || prefix_len>=sizeof(static_scan_prefix) ||
+           esp_netif_str_to_ip4(ETH_STATIC_IP,&info.ip)!=ESP_OK ||
+           esp_netif_str_to_ip4(ETH_STATIC_NETMASK,&info.netmask)!=ESP_OK ||
+           esp_netif_str_to_ip4(ETH_STATIC_GATEWAY,&info.gw)!=ESP_OK) {
+            puts("Invalid Ethernet static address settings; scan not started.");return;
+        }
+        memcpy(static_scan_prefix,ETH_STATIC_IP,prefix_len);
+        static_scan_prefix[prefix_len]=0;
+    }
+    job=(tcp_job_t){.scan=true,.id=SCAN_FIRST_ID,.last_id=SCAN_LAST_ID,
+        .fc=SCAN_FUNCTION_CODE,.start=SCAN_START_REGISTER,.end=SCAN_LAST_START_REGISTER,
+        .count=SCAN_REGISTER_COUNT,.step=SCAN_REGISTER_STEP};
+    uint8_t request[12];int octets[254],ports[32];
+    if(job.id<0 || job.last_id<job.id || job.last_id>255 || job.end<job.start || job.end>65535 ||
+       job.step<1 || job.step>65535 || job.count>65536-job.end ||
+       !mb_tcp_request(request,0,job.id,job.fc,job.start,job.count) ||
+       !tcp_prefix_valid(tcp_config.ip_prefix) ||
+       (ETH_STATIC_FALLBACK_ENABLED && (!tcp_prefix_valid(static_scan_prefix) || ETH_DHCP_TIMEOUT_SECONDS<1)) ||
+       tcp_parse_list(tcp_config.last_octets,1,254,octets,254)<1 ||
+       (!tcp_config.use_common_port && tcp_parse_list(tcp_config.custom_ports,1,65535,ports,32)<1) ||
+       tcp_config.timeout_ms<20 || tcp_config.timeout_ms>10000) {
+        puts("Invalid TCP settings in scanner_config.h; scan not started.");return;
+    }
+    printf("TCP targets: %s[%s], ports=%s, IDs=%d..%d, FC=%d, starts=%d..%d, count=%d\n",
+        tcp_config.ip_prefix,tcp_config.last_octets,tcp_config.use_common_port?"502":tcp_config.custom_ports,
+        job.id,job.last_id,job.fc,job.start,job.end,job.count);
+    if(start_ethernet()!=0 && !WIFI_FALLBACK_ENABLED) return;
+    if(xTaskCreate(network_monitor,"network_monitor",8192,NULL,5,NULL)!=pdPASS) {
+        puts("Cannot start network fallback monitor.");return;
+    }
+    atomic_store(busy,true);
+    if(xTaskCreate(automatic_scan,"tcp_auto",8192,NULL,5,NULL)!=pdPASS) {
+        atomic_store(busy,false);puts("Cannot start TCP scan worker.");
+    }
+}
