@@ -11,14 +11,14 @@
  */
 #define SCAN_FIRST_ID 1
 #define SCAN_LAST_ID 247
-#define SCAN_FUNCTION_CODE 3
+#define SCAN_FUNCTION_CODE 4
 #define SCAN_START_REGISTER 0
 #define SCAN_LAST_START_REGISTER 0
 #define SCAN_REGISTER_COUNT 1
 #define SCAN_REGISTER_STEP 1
 
 /* TCP target selection. true selects only 502; false uses CUSTOM_PORTS. */
-#define TCP_IP_PREFIX "192.168.1."
+#define TCP_IP_PREFIX "192.168.0."
 #define TCP_LAST_OCTETS "1-254"
 #define TCP_USE_COMMON_PORT true
 #define TCP_CUSTOM_PORTS "502,1502,2502"
@@ -28,7 +28,7 @@
 #define ETH_STATIC_FALLBACK_ENABLED true
 #define ETH_DHCP_TIMEOUT_SECONDS 10
 /* Change to "192.168.1.57" for the other LAN; scan prefix follows automatically. */
-#define ETH_STATIC_IP "192.168.1.57"
+#define ETH_STATIC_IP "192.168.0.57"
 #define ETH_STATIC_NETMASK "255.255.255.0"
 #define ETH_STATIC_GATEWAY "0.0.0.0"
 
