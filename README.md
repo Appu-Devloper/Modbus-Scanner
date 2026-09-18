@@ -8,7 +8,7 @@ The board scans automatically. Results appear in the USB serial monitor with lab
 
 1. Connect the Nano to your computer through its USB programming connector.
 2. For TCP, connect Ethernet to the device/network, or configure your Wi-Fi credentials. Leave `TCP_ENABLED` set to `true`.
-3. Set the target network and scan range in `main/scanner_config.h`. See the address examples below; the scanner's own IP and the target IPs have different purposes.
+3. Leave `TCP_AUTO_SUBNET=true` to derive targets from the assigned IP and subnet mask. For direct Ethernet without DHCP, unknown-network mode tries the configured candidate subnets. See the discovery settings below.
 4. Build and flash using ESP-IDF **5.5.x**, target **esp32p4**.
 5. Open the serial monitor at **115200 baud**. Look for `Active network`, `READ OK`, and `FOUND` messages.
 
@@ -19,7 +19,7 @@ Scanning does not require the monitor to be open. TCP scans restart when the sel
 | Condition | Automatic behavior |
 |---|---|
 | Ethernet cable connected | Try DHCP first. |
-| Ethernet link remains up without an IP | After about 10 seconds, use the configured static fallback address. |
+| Ethernet link remains up without an IP | After about 10 seconds, begin unknown-network subnet trials, or use the fixed static fallback if discovery is disabled. |
 | Ethernet has no IP for about 15 seconds | Start Wi-Fi fallback if enabled. |
 | Ethernet gets an IP while Wi-Fi is active | Select Ethernet and restart scanning from the first target. |
 | Selected network becomes unavailable | Wait for a usable network, then restart scanning. Wi-Fi can provide fallback. |
@@ -29,19 +29,40 @@ Ethernet is preferred whenever it has an IP address. TCP sockets are bound to th
 
 These timers are separate: the Ethernet DHCP timeout starts on link-up; the Wi-Fi delay tracks how long Ethernet has lacked an IP. Static fallback normally completes first when the cable is connected at startup.
 
-### Scanner address versus target addresses
-
-| Setting | Purpose |
-|---|---|
-| `ETH_STATIC_IP` | The scanner's own Ethernet address, used only when DHCP does not supply one. |
-| `ETH_STATIC_NETMASK` | Subnet mask for static Ethernet. Use `255.255.255.0` for the examples below. |
-| `ETH_STATIC_GATEWAY` | Router for static Ethernet. `0.0.0.0` is suitable for scanning directly reachable devices on the same subnet. |
-| `TCP_IP_PREFIX` | Target prefix when using DHCP Ethernet or Wi-Fi. It does not assign the scanner an IP. |
-| `TCP_LAST_OCTETS` | Target host numbers, used with either the configured prefix or the static fallback prefix. |
-
-Current static settings:
+### Automatic subnet scanning
 
 ```c
+#define TCP_AUTO_SUBNET true
+#define TCP_AUTO_MAX_HOSTS 1024
+```
+
+The scanner reads the active interface's IPv4 address and subnet mask. For `192.168.10.57/24`, it scans `192.168.10.1–254`, excluding itself. The same logic supports other contiguous masks, including /23 and /30. Network and broadcast addresses are excluded on conventional subnets; /31 and /32 are handled without subtracting them. A /32 has no other host to scan.
+
+Automatic mode ignores `TCP_IP_PREFIX` and `TCP_LAST_OCTETS`. It keeps the configured ports, unit IDs, function, and register range. It also applies to Wi-Fi and fixed static Ethernet. If the range exceeds `TCP_AUTO_MAX_HOSTS` (default 1,024 host addresses), the scanner explains why it did not scan; it does not silently truncate the network. Choose a manual range or increase the limit, up to 65,534, and rebuild. Scans remain sequential, so large ranges take time.
+
+A change to the selected interface's address or mask restarts the scan, even if the interface itself has not changed.
+
+### Unknown direct-Ethernet network
+
+```c
+#define ETH_STATIC_FALLBACK_ENABLED true
+#define ETH_DHCP_TIMEOUT_SECONDS 10
+#define ETH_UNKNOWN_NETWORK_ENABLED true
+#define ETH_UNKNOWN_SCANNER_IPS {"192.168.1.253", "192.168.0.253", "10.0.0.253", "172.16.0.253"}
+```
+
+After DHCP times out with the link up, the scanner assigns itself the first candidate address with mask `255.255.255.0` and no gateway. It scans that /24, skipping its own IP, using the configured Modbus read. If no valid Modbus replies arrive, it tries the next candidate. Any validated data or exception response establishes a responding subnet; the scanner completes that subnet's scan and keeps that address. An open port alone is insufficient.
+
+If all candidates fail, the output says **DISCOVERY INCONCLUSIVE**. The device may be on another subnet, use another port, or reject the chosen read without replying. This is a finite shortlist, not universal IP discovery. The implementation does not sniff ARP/other packets or detect address conflicts. Candidate scanner addresses must be unused; a device using the same address as a candidate cannot be discovered during that trial. Change the candidate list for your installation as needed. This mode is intended for direct or isolated Ethernet networks with unknown device settings.
+
+Unplugging Ethernet resets the candidate index and returns to DHCP for the next connection. With the default 500 ms timeout, each /24 trial may take roughly two minutes just for connection attempts, plus time for unit-ID reads.
+
+### Fixed static fallback and manual targets
+
+Disable unknown-network trials to retain a specific scanner address:
+
+```c
+#define ETH_UNKNOWN_NETWORK_ENABLED false
 #define ETH_STATIC_FALLBACK_ENABLED true
 #define ETH_DHCP_TIMEOUT_SECONDS 10
 #define ETH_STATIC_IP "192.168.1.57"
@@ -49,16 +70,11 @@ Current static settings:
 #define ETH_STATIC_GATEWAY "0.0.0.0"
 ```
 
-To use another LAN, change only `ETH_STATIC_IP` for the static fallback case:
+DHCP is still tried first. The fixed static settings are used only if DHCP fails. Set `ETH_STATIC_IP` to an unused address compatible with your device's subnet, such as `192.168.0.57` for a `192.168.0.x/24` LAN. A gateway of `0.0.0.0` is sufficient for directly reachable devices on the same subnet. The scanner assigns only its own address; it does not run a DHCP server or configure other devices.
 
-| Scanner static IP | Static fallback targets with `TCP_LAST_OCTETS "1-254"` |
-|---|---|
-| `192.168.1.57` | `192.168.1.1–254` |
-| `192.168.0.57` | `192.168.0.1–254` |
+With `TCP_AUTO_SUBNET=true`, the static address and mask determine the full scan range. To narrow targets, set `TCP_AUTO_SUBNET=false`: DHCP Ethernet and Wi-Fi then use `TCP_IP_PREFIX` plus `TCP_LAST_OCTETS`, while fixed static Ethernet derives its prefix from the first three octets of `ETH_STATIC_IP` and uses `TCP_LAST_OCTETS`. Unknown-network mode always scans each candidate's full /24, even if manual target mode is selected.
 
-The fallback prefix is derived from the first three octets of `ETH_STATIC_IP`. There is no separate static scan-prefix setting. This is a last-octet scan, not automatic enumeration of arbitrary subnet sizes. DHCP and Wi-Fi scans still use `TCP_IP_PREFIX`; they do not automatically derive targets from their assigned address.
-
-The scanner's static address must be unused. Connected Modbus devices must already have compatible addresses. Static fallback assigns an address to **the scanner only**; it does not run a DHCP server or reconfigure other devices. Rebuild and flash after editing.
+All these settings are compiled into firmware. Rebuild and flash after editing.
 
 ### Wi-Fi settings
 
@@ -79,6 +95,8 @@ Current scan defaults:
 
 ```c
 #define TCP_ENABLED true
+#define TCP_AUTO_SUBNET true
+#define TCP_AUTO_MAX_HOSTS 1024
 #define TCP_IP_PREFIX "192.168.1."
 #define TCP_LAST_OCTETS "1-254"
 #define TCP_USE_COMMON_PORT true
@@ -86,7 +104,7 @@ Current scan defaults:
 #define TCP_TIMEOUT_MS 500
 ```
 
-The prefix must include its trailing dot. Last octets accept individual hosts, lists, and inclusive ranges, such as `"201"` or `"1,5,10-20"`. Host values are 1–254.
+For manual target mode (`TCP_AUTO_SUBNET=false`), the prefix must include its trailing dot. Last octets accept individual hosts, lists, and inclusive ranges, such as `"201"` or `"1,5,10-20"`. Host values are 1–254.
 
 `TCP_USE_COMMON_PORT=true` checks only port 502. Set it to `false` to use `TCP_CUSTOM_PORTS`, which supports up to 32 distinct ports. An open TCP port is followed by Modbus requests; it is not itself proof of a Modbus device.
 
@@ -101,14 +119,14 @@ These settings apply to both transports:
 ```c
 #define SCAN_FIRST_ID 1
 #define SCAN_LAST_ID 247
-#define SCAN_FUNCTION_CODE 3
+#define SCAN_FUNCTION_CODE 4
 #define SCAN_START_REGISTER 0
 #define SCAN_LAST_START_REGISTER 0
 #define SCAN_REGISTER_COUNT 1
 #define SCAN_REGISTER_STEP 1
 ```
 
-The defaults try **unit IDs 1–247**, reading **one holding register at offset 0**. ID and starting-offset bounds are inclusive. `SCAN_REGISTER_STEP` controls the distance between starting offsets; `SCAN_REGISTER_COUNT` is the number of items in each request.
+The defaults try **unit IDs 1–247**, reading **one input register at offset 0 (FC04)**. ID and starting-offset bounds are inclusive. `SCAN_REGISTER_STEP` controls the distance between starting offsets; `SCAN_REGISTER_COUNT` is the number of items in each request.
 
 | Function | Data read | Maximum items per request |
 |---|---|---|
@@ -122,6 +140,8 @@ Register offsets are zero-based wire addresses. A manual's holding register 4000
 For example, to focus on IP `192.168.1.201`, units 2–3, and one register:
 
 ```c
+#define TCP_AUTO_SUBNET false
+#define ETH_UNKNOWN_NETWORK_ENABLED false
 #define TCP_IP_PREFIX "192.168.1."
 #define TCP_LAST_OCTETS "201"
 #define SCAN_FIRST_ID 2
@@ -232,7 +252,7 @@ Close an existing monitor with **Ctrl+]** before flashing. To view output withou
 | Symptom | What to check |
 |---|---|
 | `Waiting for Ethernet link` | Cable, connected device/switch power, and link LEDs. Static IP cannot fix a missing physical link. |
-| Link up, no DHCP address | Wait for static fallback, or check the DHCP server. Confirm the fallback address matches the devices' subnet. |
+| Link up, no DHCP address | Wait for subnet discovery or fixed static fallback, or check the DHCP server. |
 | Wi-Fi initialization fails | Compatible ESP-Hosted firmware on the C6, board wiring/configuration, and reset to retry. |
 | Wi-Fi repeatedly disconnects | SSID, password, 2.4 GHz availability, and signal strength; the log includes a reason code. |
 | No Modbus replies | Target subnet, device power, port, unit IDs, function, register offset, and count. Try a known device/block first. |
@@ -243,7 +263,7 @@ Close an existing monitor with **Ctrl+]** before flashing. To view output withou
 
 Ethernet hardware defaults are IP101 PHY address 1, MDC GPIO31, MDIO GPIO52, and reset GPIO51. C6 SDIO defaults are CLK18, CMD19, D0–D3 GPIO14–17, and reset GPIO54. These are Nano-specific; other boards may require changes.
 
-Observed board logs have demonstrated Wi-Fi DHCP operation and Ethernet static fallback at `192.168.1.57` with valid Modbus replies. These observations do not validate every handover, device, or RS-485 configuration. The latest readable output changes have been build-checked; verify them on your board after flashing.
+Observed board logs have demonstrated Wi-Fi DHCP operation and Ethernet static fallback at `192.168.1.57` with valid Modbus replies. These observations do not validate every handover, device, or RS-485 configuration. Automatic subnet calculation has host tests. Unknown-network transitions and discovery on actual devices still need hardware verification after flashing.
 
 ## Developer checks
 

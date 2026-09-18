@@ -36,6 +36,11 @@ static atomic_bool link_up;
 static atomic_bool ethernet_static;
 static char static_scan_prefix[13];
 static int64_t dhcp_deadline;
+static const char *const unknown_ips[]=ETH_UNKNOWN_SCANNER_IPS;
+_Static_assert(sizeof(unknown_ips)/sizeof(unknown_ips[0])>0,"At least one discovery address is required");
+static size_t unknown_index;
+static uint32_t selected_ip,selected_mask; // event loop only
+
 ESP_EVENT_DEFINE_BASE(SCANNER_NETWORK_EVENT);
 static bool ethernet_started, ethernet_attempted;
 static esp_netif_t *netif,*wifi_netif;
@@ -48,7 +53,11 @@ static void select_network(void) {
         esp_err_t err=esp_netif_set_default_netif(selected==1?netif:wifi_netif);
         if(err!=ESP_OK) printf("Default network selection failed: %s\n",esp_err_to_name(err));
     }
-    if(atomic_exchange(&preferred_network,selected)!=selected) {
+    esp_netif_ip_info_t current={0};
+    if(selected) esp_netif_get_ip_info(selected==1?netif:wifi_netif,&current);
+    bool address_changed=current.ip.addr!=selected_ip || current.netmask.addr!=selected_mask;
+    selected_ip=current.ip.addr;selected_mask=current.netmask.addr;
+    if(atomic_exchange(&preferred_network,selected)!=selected || address_changed) {
         atomic_fetch_add(&network_revision,1);
         puts(selected==1?"Active network: Ethernet. TCP connections will use Ethernet.":
             selected==2?"Active network: Wi-Fi fallback.":"No network IP; TCP scan will wait.");
@@ -58,15 +67,35 @@ static uint16_t transaction;
 typedef struct {int id,last_id,fc,start,end,count,step; bool scan; char ip[16];int port;} tcp_job_t;
 static tcp_job_t job;
 static void static_fallback_event(void *arg,esp_event_base_t base,int32_t id,void *data) {
-    (void)arg;(void)base;(void)id;(void)data;
+    (void)arg;(void)base;
+    if(id==1) {
+        unsigned requested_revision=data?*(unsigned *)data:0;
+        if(!ETH_UNKNOWN_NETWORK_ENABLED || !atomic_load(&ethernet_static) ||
+           !atomic_load(&link_up) || requested_revision!=atomic_load(&network_revision)) return;
+        if(unknown_index+1>=sizeof(unknown_ips)/sizeof(unknown_ips[0])) {
+            puts("DISCOVERY INCONCLUSIVE: no Modbus replies on the candidate subnets. The device may be on another subnet or need different read settings. Use its configuration utility/manual or a packet capture.");
+            return;
+        }
+        esp_netif_ip_info_t next={0};
+        esp_netif_str_to_ip4(unknown_ips[unknown_index+1],&next.ip);
+        esp_netif_str_to_ip4("255.255.255.0",&next.netmask);
+        esp_err_t err=esp_netif_set_ip_info(netif,&next);
+        if(err!=ESP_OK) {printf("Discovery address change failed: %s\n",esp_err_to_name(err));return;}
+        unknown_index++;
+        printf("Unknown-network discovery: trying scanner IP %s/24\n",unknown_ips[unknown_index]);
+        select_network();return;
+    }
     if(!ETH_STATIC_FALLBACK_ENABLED || !atomic_load(&link_up) ||
        atomic_load(&network_ready) || !dhcp_deadline || esp_timer_get_time()<dhcp_deadline) return;
     esp_netif_ip_info_t info={0};
     // A DHCP lease may be ready while its GOT_IP event is still queued.
     if(esp_netif_get_ip_info(netif,&info)==ESP_OK && info.ip.addr!=0) return;
-    if(esp_netif_str_to_ip4(ETH_STATIC_IP,&info.ip)!=ESP_OK ||
-       esp_netif_str_to_ip4(ETH_STATIC_NETMASK,&info.netmask)!=ESP_OK ||
-       esp_netif_str_to_ip4(ETH_STATIC_GATEWAY,&info.gw)!=ESP_OK) {
+    const char *fallback_ip=ETH_UNKNOWN_NETWORK_ENABLED?unknown_ips[unknown_index]:ETH_STATIC_IP;
+    const char *fallback_mask=ETH_UNKNOWN_NETWORK_ENABLED?"255.255.255.0":ETH_STATIC_NETMASK;
+    const char *fallback_gateway=ETH_UNKNOWN_NETWORK_ENABLED?"0.0.0.0":ETH_STATIC_GATEWAY;
+    if(esp_netif_str_to_ip4(fallback_ip,&info.ip)!=ESP_OK ||
+       esp_netif_str_to_ip4(fallback_mask,&info.netmask)!=ESP_OK ||
+       esp_netif_str_to_ip4(fallback_gateway,&info.gw)!=ESP_OK) {
         puts("Invalid Ethernet static IP settings.");dhcp_deadline=0;return;
     }
     esp_err_t err=esp_netif_dhcpc_stop(netif);
@@ -76,7 +105,7 @@ static void static_fallback_event(void *arg,esp_event_base_t base,int32_t id,voi
             atomic_store(&ethernet_static,true);
             atomic_store(&network_ready,true);
             printf("DHCP timed out; Ethernet static IP: %s, mask: %s, gateway: %s\n",
-                ETH_STATIC_IP,ETH_STATIC_NETMASK,ETH_STATIC_GATEWAY);
+                fallback_ip,fallback_mask,fallback_gateway);
             select_network();dhcp_deadline=0;return;
         }
         esp_netif_dhcpc_start(netif);
@@ -98,7 +127,7 @@ static void network_event(void *arg,esp_event_base_t base,int32_t id,void *data)
         puts("Ethernet link UP; waiting for DHCP address.");
     } else if(base==ETH_EVENT && (id==ETHERNET_EVENT_DISCONNECTED || id==ETHERNET_EVENT_STOP)) {
         atomic_store(&link_up,false);atomic_store(&network_ready,false);
-        dhcp_deadline=0;
+        dhcp_deadline=0;unknown_index=0;
         if(atomic_exchange(&ethernet_static,false)) {
             esp_netif_ip_info_t empty={0};
             ESP_ERROR_CHECK(esp_netif_set_ip_info(netif,&empty));
@@ -271,12 +300,37 @@ scan_again:
     int octets[254],ports[32];
     int no=tcp_parse_list(tcp_config.last_octets,1,254,octets,254);
     int np=tcp_config.use_common_port?(ports[0]=502,1):tcp_parse_list(tcp_config.custom_ports,1,65535,ports,32);
+    esp_netif_ip_info_t scan_info={0};
+    int scan_network=atomic_load(&preferred_network);
+    if(esp_netif_get_ip_info(scan_network==1?netif:wifi_netif,&scan_info)!=ESP_OK) goto wait_for_change;
+    uint32_t self_ip=ntohl(scan_info.ip.addr),first_ip=0,last_ip=0;
+    bool auto_range=job.scan && (TCP_AUTO_SUBNET ||
+        (scan_network==1 && atomic_load(&ethernet_static) && ETH_UNKNOWN_NETWORK_ENABLED));
+    if(auto_range) {
+        if(!tcp_subnet_range(self_ip,ntohl(scan_info.netmask.addr),TCP_AUTO_MAX_HOSTS,&first_ip,&last_ip)) {
+            printf("Automatic scan range unavailable: invalid mask or more than %u hosts. Set a manual target range or adjust TCP_AUTO_MAX_HOSTS; no partial scan was performed.\n",(unsigned)TCP_AUTO_MAX_HOSTS);
+            goto wait_for_change;
+        }
+        no=(int)(last_ip-first_ip+1);
+        struct in_addr first={.s_addr=htonl(first_ip)},last={.s_addr=htonl(last_ip)};
+        char a[16],z[16];inet_ntop(AF_INET,&first,a,sizeof(a));inet_ntop(AF_INET,&last,z,sizeof(z));
+        printf("Automatic target range: %s–%s (scanner's own IP skipped)\n",a,z);
+    }
     if(!job.scan) {no=np=1;ports[0]=job.port;}
     for(int o=0;o<no && !atomic_load(cancel);o++) for(int p=0;p<np && !atomic_load(cancel);p++) {
         if(revision!=atomic_load(&network_revision)) goto scan_again;
         const char *prefix=atomic_load(&preferred_network)==1 && atomic_load(&ethernet_static)?
             static_scan_prefix:tcp_config.ip_prefix;
-        char ip[16];if(job.scan) snprintf(ip,sizeof(ip),"%s%d",prefix,octets[o]);else strcpy(ip,job.ip);
+        char ip[16];
+        if(auto_range) {
+            uint32_t target=first_ip+(uint32_t)o;
+            if(target==self_ip) continue;
+            struct in_addr addr={.s_addr=htonl(target)};
+            inet_ntop(AF_INET,&addr,ip,sizeof(ip));
+        } else if(job.scan) snprintf(ip,sizeof(ip),"%s%d",prefix,octets[o]);
+        else strcpy(ip,job.ip);
+        struct in_addr target_address;
+        if(inet_pton(AF_INET,ip,&target_address)==1 && ntohl(target_address.s_addr)==self_ip) continue;
         checked++;
         if(checked==1 || checked%10==0)
             printf("Scan progress: checking endpoint %u/%d | %u Modbus endpoints found\n",checked,no*np,endpoints);
@@ -327,6 +381,12 @@ scan_again:
     if(!matches) puts("No Modbus replies found. Check device power, target subnet, TCP port, and supported register/function.");
     puts("No reply to this read does not prove that a device is absent.");
     printf("TCP %s: %u requests, %u validated responses\n",atomic_load(cancel)?"stopped":"done",probes,matches);
+    if(!matches && !atomic_load(cancel) && scan_network==1 && atomic_load(&ethernet_static) && ETH_UNKNOWN_NETWORK_ENABLED) {
+        esp_err_t err=esp_event_post(SCANNER_NETWORK_EVENT,1,&revision,sizeof(revision),pdMS_TO_TICKS(100));
+        if(err!=ESP_OK) printf("Cannot advance unknown-network discovery: %s\n",esp_err_to_name(err));
+    } else if(matches && scan_network==1 && atomic_load(&ethernet_static) && ETH_UNKNOWN_NETWORK_ENABLED)
+        puts("Unknown-network discovery found a responding subnet; keeping this Ethernet address.");
+wait_for_change:
     atomic_store(busy,false);
     while(!atomic_load(cancel) && revision==atomic_load(&network_revision)) vTaskDelay(pdMS_TO_TICKS(250));
     if(!atomic_load(cancel)) goto scan_again;
@@ -350,6 +410,19 @@ static void automatic_scan(void *unused) {
 }
 void tcp_scanner_start(atomic_bool *b,atomic_bool *c) {
     busy=b;cancel=c;
+    if(TCP_AUTO_MAX_HOSTS<2 || TCP_AUTO_MAX_HOSTS>65534 ||
+       (ETH_UNKNOWN_NETWORK_ENABLED && !ETH_STATIC_FALLBACK_ENABLED)) {
+        puts("Invalid automatic discovery settings; scan not started.");return;
+    }
+    if(ETH_UNKNOWN_NETWORK_ENABLED) {
+        for(size_t i=0;i<sizeof(unknown_ips)/sizeof(unknown_ips[0]);i++) {
+            esp_ip4_addr_t ip;
+            if(esp_netif_str_to_ip4(unknown_ips[i],&ip)!=ESP_OK ||
+               (ntohl(ip.addr)&255)==0 || (ntohl(ip.addr)&255)==255) {
+                puts("Invalid unknown-network candidate address; scan not started.");return;
+            }
+        }
+    }
     if(ETH_STATIC_FALLBACK_ENABLED) {
         esp_netif_ip_info_t info={0};
         const char *last_dot=strrchr(ETH_STATIC_IP,'.');
@@ -377,8 +450,8 @@ void tcp_scanner_start(atomic_bool *b,atomic_bool *c) {
        tcp_config.timeout_ms<20 || tcp_config.timeout_ms>10000) {
         puts("Invalid TCP settings in scanner_config.h; scan not started.");return;
     }
-    printf("TCP targets: %s[%s], ports=%s, IDs=%d..%d, FC=%d, starts=%d..%d, count=%d\n",
-        tcp_config.ip_prefix,tcp_config.last_octets,tcp_config.use_common_port?"502":tcp_config.custom_ports,
+    printf("TCP targets: %s, ports=%s, IDs=%d..%d, FC=%d, starts=%d..%d, count=%d\n",
+        TCP_AUTO_SUBNET?"automatic from interface IP/netmask":"manual (scanner_config.h)",tcp_config.use_common_port?"502":tcp_config.custom_ports,
         job.id,job.last_id,job.fc,job.start,job.end,job.count);
     if(start_ethernet()!=0 && !WIFI_FALLBACK_ENABLED) return;
     if(xTaskCreate(network_monitor,"network_monitor",8192,NULL,5,NULL)!=pdPASS) {

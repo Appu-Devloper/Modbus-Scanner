@@ -32,5 +32,23 @@ int main(void) {
     assert(tcp_prefix_valid("10.73.21."));assert(tcp_prefix_valid("192.168.1."));
     const char *prefixes[]={"192.168.1","192.168.1.1","256.1.1.","1..1.","01.2.3.","1.2.3.x","", "9999999999999999999.1.1."};
     for(size_t i=0;i<sizeof(prefixes)/sizeof(prefixes[0]);i++) assert(!tcp_prefix_valid(prefixes[i]));
+    uint32_t first,last;
+    assert(tcp_subnet_range(0xc0a80139,0xffffff00,1024,&first,&last));
+    assert(first==0xc0a80101 && last==0xc0a801fe);
+    assert(tcp_subnet_range(0xc0a80339,0xfffffe00,1024,&first,&last));
+    assert(first==0xc0a80201 && last==0xc0a803fe);
+    assert(tcp_subnet_range(0xc0a80105,0xfffffffc,1024,&first,&last));
+    assert(first==0xc0a80105 && last==0xc0a80106);
+    assert(tcp_subnet_range(0xc0a80104,0xfffffffe,1024,&first,&last));
+    assert(first==0xc0a80104 && last==0xc0a80105);
+    assert(tcp_subnet_range(0xc0a80105,0xffffffff,1024,&first,&last));
+    assert(first==last && first==0xc0a80105);
+    assert(!tcp_subnet_range(0x0a000001,0xffff0000,1024,&first,&last));
+    assert(!tcp_subnet_range(0xc0a80105,0xffff00ff,1024,&first,&last));
+    assert(!tcp_subnet_range(0xc0a80105,0,1024,&first,&last));
+    assert(!tcp_subnet_range(0,0xffffff00,1024,&first,&last));
+    assert(!tcp_subnet_range(0xc0a80105,0xffffff00,253,&first,&last));
+    assert(!tcp_subnet_range(0xc0a80100,0xffffff00,1024,&first,&last));
+    assert(!tcp_subnet_range(0xc0a801ff,0xffffff00,1024,&first,&last));
     puts("TCP framing and configuration tests passed");
 }

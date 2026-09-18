@@ -18,6 +18,10 @@
 #define SCAN_REGISTER_STEP 1
 
 /* TCP target selection. true selects only 502; false uses CUSTOM_PORTS. */
+/* Auto mode derives the full subnet from the selected interface's IP/mask.
+ * Manual mode uses TCP_IP_PREFIX and TCP_LAST_OCTETS as before. */
+#define TCP_AUTO_SUBNET true
+#define TCP_AUTO_MAX_HOSTS 1024
 #define TCP_IP_PREFIX "192.168.0."
 #define TCP_LAST_OCTETS "1-254"
 #define TCP_USE_COMMON_PORT true
@@ -32,8 +36,14 @@
 #define ETH_STATIC_NETMASK "255.255.255.0"
 #define ETH_STATIC_GATEWAY "0.0.0.0"
 
+/* Unknown direct Ethernet: try these /24 scanner addresses after DHCP fails.
+ * Addresses must be unused. Disable to use ETH_STATIC_IP only.
+ * No passive packet sniffing or automatic address-conflict detection. */
+#define ETH_UNKNOWN_NETWORK_ENABLED true
+#define ETH_UNKNOWN_SCANNER_IPS {"192.168.1.253", "10.24.26.253","192.168.0.253", "172.16.0.253"}
+
 /* Wi-Fi fallback uses the Nano's ESP32-C6 over SDIO. */
-#define WIFI_FALLBACK_ENABLED true
+#define WIFI_FALLBACK_ENABLED false
 #define WIFI_FALLBACK_DELAY_SECONDS 15
 #define WIFI_SSID "HERIN-2.5G"
 #define WIFI_PASSWORD "1011@herin"

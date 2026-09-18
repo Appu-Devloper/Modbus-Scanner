@@ -33,3 +33,13 @@ bool tcp_prefix_valid(const char *s) {
     }
     return !*s;
 }
+
+bool tcp_subnet_range(uint32_t ip,uint32_t mask,uint32_t limit,
+                      uint32_t *first,uint32_t *last) {
+    uint32_t hosts=~mask;
+    if(!first || !last || !mask || !ip || (hosts & (hosts+1U))) return false;
+    uint32_t lo=ip & mask,hi=lo | hosts;
+    if(hosts>1) {lo++;hi--;}
+    if(ip<lo || ip>hi || (uint64_t)hi-lo+1>limit) return false;
+    *first=lo;*last=hi;return true;
+}
