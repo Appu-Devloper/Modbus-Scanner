@@ -50,5 +50,13 @@ int main(void) {
     assert(!tcp_subnet_range(0xc0a80105,0xffffff00,253,&first,&last));
     assert(!tcp_subnet_range(0xc0a80100,0xffffff00,1024,&first,&last));
     assert(!tcp_subnet_range(0xc0a801ff,0xffffff00,1024,&first,&last));
+    assert(tcp_next_candidate(-1,4,true,false,true)==0); // DHCP found a device: continue.
+    assert(tcp_next_candidate(0,4,true,true,true)==1); // Static reply also continues.
+    assert(tcp_next_candidate(2,4,true,true,false)==3);
+    assert(tcp_next_candidate(3,4,true,true,false)==-1); // No cycling after last.
+    assert(tcp_next_candidate(-1,4,false,false,false)==-1); // Legacy DHCP behavior.
+    assert(tcp_next_candidate(0,4,false,true,true)==-1); // Legacy stop on response.
+    assert(tcp_next_candidate(0,4,false,true,false)==1);
+    assert(tcp_next_candidate(-1,0,true,false,false)==-1);
     puts("TCP framing and configuration tests passed");
 }

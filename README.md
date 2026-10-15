@@ -4,6 +4,8 @@ Find responding Modbus endpoints and read raw register values using a Waveshare 
 
 The board scans automatically. Results appear in the USB serial monitor with labeled TCP fields and a summary of responding unit IDs. Configuration is currently compiled into firmware: there is **no browser page or interactive terminal menu**. Edit [main/scanner_config.h](main/scanner_config.h), rebuild, and flash to change settings.
 
+Current configuration: **forced-static Ethernet at `10.24.26.253/24`**, scanning `10.24.26.1–254` with FC04. DHCP and candidate-subnet trials are bypassed. The mode examples below show how to change this configuration.
+
 ## Quick start
 
 1. Connect the Nano to your computer through its USB programming connector.
@@ -12,13 +14,13 @@ The board scans automatically. Results appear in the USB serial monitor with lab
 4. Build and flash using ESP-IDF **5.5.x**, target **esp32p4**.
 5. Open the serial monitor at **115200 baud**. Look for `Active network`, `READ OK`, and `FOUND` messages.
 
-Scanning does not require the monitor to be open. TCP scans restart when the selected network changes, including after a completed scan. With a stable network, a completed scan waits rather than repeating continuously. Reset the board to repeat manually. RTU performs one scan per boot.
+Scanning does not require the monitor to be open. TCP scans restart when the selected network changes, including after a completed scan. Multi-subnet mode also advances after each completed Ethernet subnet scan. With a stable network, a completed scan waits rather than repeating continuously. Reset the board to repeat manually. RTU performs one scan per boot.
 
 ## Network connection and fallback
 
 | Condition | Automatic behavior |
 |---|---|
-| Ethernet cable connected | Try DHCP first. |
+| Ethernet cable connected | Try DHCP first, unless forced-static mode is enabled. |
 | Ethernet link remains up without an IP | After about 10 seconds, begin unknown-network subnet trials, or use the fixed static fallback if discovery is disabled. |
 | Ethernet has no IP for about 15 seconds | Start Wi-Fi fallback if enabled. |
 | Ethernet gets an IP while Wi-Fi is active | Select Ethernet and restart scanning from the first target. |
@@ -42,26 +44,31 @@ Automatic mode ignores `TCP_IP_PREFIX` and `TCP_LAST_OCTETS`. It keeps the confi
 
 A change to the selected interface's address or mask restarts the scan, even if the interface itself has not changed.
 
-### Unknown direct-Ethernet network
+### Multiple Ethernet subnets on the same switch
 
 ```c
-#define ETH_STATIC_FALLBACK_ENABLED true
-#define ETH_DHCP_TIMEOUT_SECONDS 10
+#define ETH_FORCE_STATIC false
+#define ETH_SCAN_ALL_SUBNETS true
 #define ETH_UNKNOWN_NETWORK_ENABLED true
-#define ETH_UNKNOWN_SCANNER_IPS {"192.168.1.253", "192.168.0.253", "10.0.0.253", "172.16.0.253"}
+#define ETH_UNKNOWN_SCANNER_IPS {"192.168.1.253", "10.24.26.253", "192.168.0.253", "172.16.0.253"}
 ```
 
-After DHCP times out with the link up, the scanner assigns itself the first candidate address with mask `255.255.255.0` and no gateway. It scans that /24, skipping its own IP, using the configured Modbus read. If no valid Modbus replies arrive, it tries the next candidate. Any validated data or exception response establishes a responding subnet; the scanner completes that subnet's scan and keeps that address. An open port alone is insufficient.
+With these settings, the Nano scans the DHCP-assigned subnet first, then stops DHCP and tries **every candidate subnet**, even if earlier scans found devices. Each candidate is a temporary scanner address with mask `255.255.255.0` and no gateway. For example, a DHCP address of `192.168.1.40` does not prevent a later trial using `10.24.26.253` to reach a PLC at `10.24.26.5`.
 
-If all candidates fail, the output says **DISCOVERY INCONCLUSIVE**. The device may be on another subnet, use another port, or reject the chosen read without replying. This is a finite shortlist, not universal IP discovery. The implementation does not sniff ARP/other packets or detect address conflicts. Candidate scanner addresses must be unused; a device using the same address as a candidate cannot be discovered during that trial. Change the candidate list for your installation as needed. This mode is intended for direct or isolated Ethernet networks with unknown device settings.
+The ports must share the same VLAN/broadcast domain for this direct communication. Candidate scanner addresses must be unused. Changing the Nano's IP does not change the PLC or switch configuration. The scanner uses one Ethernet address at a time, not simultaneous connections to all subnets. A candidate matching the DHCP subnet is scanned again; results can therefore repeat across trials.
 
-Unplugging Ethernet resets the candidate index and returns to DHCP for the next connection. With the default 500 ms timeout, each /24 trial may take roughly two minutes just for connection attempts, plus time for unit-ID reads.
+If DHCP fails, discovery starts at the first candidate after `ETH_DHCP_TIMEOUT_SECONDS`. Each candidate scan has its own summary. After the last candidate, the scanner reports completion (or **DISCOVERY INCONCLUSIVE** if no Modbus replies were found anywhere), keeps the final candidate address, and waits. It does not automatically restore DHCP or retain access to previously scanned subnets. Unplugging/resetting restarts the process.
+
+Set `ETH_SCAN_ALL_SUBNETS=false` to restore the earlier behavior: candidate trials only follow DHCP failure and stop at the first subnet producing a valid data or exception response. Set `ETH_UNKNOWN_NETWORK_ENABLED=false` to disable candidate trials entirely.
+
+This is a finite configurable shortlist, not exhaustive discovery of all private IP addresses. It does not sniff packets or detect IP conflicts. Each /24 may take roughly two minutes for connection attempts, plus time for unit-ID reads. A silent device, an unlisted subnet, a different port, or unsuitable read settings may still require manual configuration or a manufacturer discovery tool.
 
 ### Fixed static fallback and manual targets
 
-Disable unknown-network trials to retain a specific scanner address:
+For a known PLC subnet, enable forced-static mode to bypass DHCP and candidate trials:
 
 ```c
+#define ETH_FORCE_STATIC true
 #define ETH_UNKNOWN_NETWORK_ENABLED false
 #define ETH_STATIC_FALLBACK_ENABLED true
 #define ETH_DHCP_TIMEOUT_SECONDS 10
@@ -70,7 +77,7 @@ Disable unknown-network trials to retain a specific scanner address:
 #define ETH_STATIC_GATEWAY "0.0.0.0"
 ```
 
-DHCP is still tried first. The fixed static settings are used only if DHCP fails. Set `ETH_STATIC_IP` to an unused address compatible with your device's subnet, such as `192.168.0.57` for a `192.168.0.x/24` LAN. A gateway of `0.0.0.0` is sufficient for directly reachable devices on the same subnet. The scanner assigns only its own address; it does not run a DHCP server or configure other devices.
+`ETH_FORCE_STATIC=true` uses the fixed address on every connection, even if a DHCP server is available. To use it only as a fallback, set `ETH_FORCE_STATIC=false` and leave candidate discovery disabled. Set `ETH_STATIC_IP` to an unused address compatible with your device's subnet, such as `192.168.0.57` for a `192.168.0.x/24` LAN. A gateway of `0.0.0.0` is sufficient for directly reachable devices on the same subnet. For PLC `10.24.26.5/24`, an example is `ETH_STATIC_IP "10.24.26.253"` if unused, with mask `255.255.255.0`. The scanner assigns only its own address; it does not run a DHCP server or configure other devices.
 
 With `TCP_AUTO_SUBNET=true`, the static address and mask determine the full scan range. To narrow targets, set `TCP_AUTO_SUBNET=false`: DHCP Ethernet and Wi-Fi then use `TCP_IP_PREFIX` plus `TCP_LAST_OCTETS`, while fixed static Ethernet derives its prefix from the first three octets of `ETH_STATIC_IP` and uses `TCP_LAST_OCTETS`. Unknown-network mode always scans each candidate's full /24, even if manual target mode is selected.
 

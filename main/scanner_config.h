@@ -22,30 +22,34 @@
  * Manual mode uses TCP_IP_PREFIX and TCP_LAST_OCTETS as before. */
 #define TCP_AUTO_SUBNET true
 #define TCP_AUTO_MAX_HOSTS 1024
-#define TCP_IP_PREFIX "192.168.0."
+#define TCP_IP_PREFIX "10.9.9."
 #define TCP_LAST_OCTETS "1-254"
 #define TCP_USE_COMMON_PORT true
 #define TCP_CUSTOM_PORTS "502,1502,2502"
 #define TCP_TIMEOUT_MS 500
 
 /* Ethernet: DHCP first, then static address while link remains connected. */
+/* Force static skips DHCP and candidate discovery. Otherwise multi-subnet
+ * scans DHCP first, then every configured candidate regardless of replies. */
+#define ETH_FORCE_STATIC true
+#define ETH_SCAN_ALL_SUBNETS false
 #define ETH_STATIC_FALLBACK_ENABLED true
 #define ETH_DHCP_TIMEOUT_SECONDS 10
-/* Change to "192.168.1.57" for the other LAN; scan prefix follows automatically. */
-#define ETH_STATIC_IP "192.168.0.57"
+/* Nano address for the PLC LAN; must be unused. Auto scan uses this subnet. */
+#define ETH_STATIC_IP "10.9.9.57"
 #define ETH_STATIC_NETMASK "255.255.255.0"
-#define ETH_STATIC_GATEWAY "0.0.0.0"
+#define ETH_STATIC_GATEWAY "10.9.9.1"
 
 /* Unknown direct Ethernet: try these /24 scanner addresses after DHCP fails.
  * Addresses must be unused. Disable to use ETH_STATIC_IP only.
  * No passive packet sniffing or automatic address-conflict detection. */
-#define ETH_UNKNOWN_NETWORK_ENABLED true
-#define ETH_UNKNOWN_SCANNER_IPS {"192.168.1.253", "10.24.26.253","192.168.0.253", "172.16.0.253"}
+#define ETH_UNKNOWN_NETWORK_ENABLED false
+#define ETH_UNKNOWN_SCANNER_IPS {"10.9.9.253"}
 
 /* Wi-Fi fallback uses the Nano's ESP32-C6 over SDIO. */
 #define WIFI_FALLBACK_ENABLED false
 #define WIFI_FALLBACK_DELAY_SECONDS 15
-#define WIFI_SSID "HERIN-2.5G"
+#define WIFI_SSID "HERIN-2.5"
 #define WIFI_PASSWORD "1011@herin"
 
 /* RS-485 serial configuration. ALL=true tries rates below and N/E/O, 1/2 stops. */

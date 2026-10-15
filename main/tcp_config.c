@@ -43,3 +43,9 @@ bool tcp_subnet_range(uint32_t ip,uint32_t mask,uint32_t limit,
     if(ip<lo || ip>hi || (uint64_t)hi-lo+1>limit) return false;
     *first=lo;*last=hi;return true;
 }
+
+int tcp_next_candidate(int current,int count,bool all_subnets,bool static_active,bool had_reply) {
+    if(current < -1 || count<=0 || current>=count-1) return -1;
+    if(!all_subnets && (!static_active || had_reply)) return -1;
+    return current+1;
+}
