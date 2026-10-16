@@ -1,1 +1,1 @@
-idf_component_register(SRCS "scanner.c" "modbus.c" "modbus_tcp.c" "tcp_scanner.c" "tcp_config.c" INCLUDE_DIRS "." REQUIRES esp_driver_uart esp_driver_gpio esp_timer esp_eth esp_wifi nvs_flash esp_netif esp_event lwip)
+idf_component_register(SRCS "s7_settimino.cpp" "scanner.c" "modbus.c" "modbus_tcp.c" "tcp_scanner.c" "tcp_config.c" INCLUDE_DIRS "." REQUIRES settimino esp_driver_uart esp_driver_gpio esp_timer esp_eth esp_wifi nvs_flash esp_netif esp_event lwip)

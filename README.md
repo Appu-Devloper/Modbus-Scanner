@@ -1,18 +1,69 @@
+# Choose a mode
+
+Edit `main/scanner_config.h`. Set exactly one mode to `true`:
+
+```c
+#define S7_ENABLED true
+#define TCP_ENABLED false
+#define PING_ENABLED false
+#define RS485_ENABLED false
+```
+
+Multiple enabled modes or no enabled mode causes a build error.
+Rebuild and flash after changing settings.
+
+## What each mode does
+
+**When `S7_ENABLED` is `true`, the Nano tries to read data from a Siemens PLC using the S7 protocol.** It connects to `S7_TARGET_IP` on TCP port 102, using `S7_RACK` and `S7_SLOT`, and reads one input byte selected by `S7_INPUT_BYTE`. With the current settings, it connects to `192.168.0.2`, uses rack 0 and slot 1, and reads input byte IB0. It prints the value if the read succeeds or an error if it fails. It does not write PLC data or start or stop the CPU. The PLC must allow the read, and IB0 is not necessarily the address of your ET 200SP inputs. This mode uses Settimino; its source information is in `components/settimino/README.md`.
+
+**When `TCP_ENABLED` is `true`, the Nano checks TCP connections to devices on the Ethernet or Wi-Fi network.** This mode has two choices, controlled by `TCP_SCAN_IPS`.
+
+When `TCP_SCAN_IPS` is `true`, the Nano checks a range of IP addresses and the selected ports. With the current settings, it checks `192.168.0.1` through `192.168.0.254` on ports 102 and 502, skipping its own address, `192.168.0.27`. It prints each open IP/port combination and a final count. This tells you which ports accept connections; it does not prove that the device will allow an S7 or Modbus read.
+
+When `TCP_SCAN_IPS` is `false`, the Nano checks only `TCP_TARGET_IP` and `TCP_TARGET_PORT`. For example, `192.168.0.2` and port 502 test whether that CPU accepts a TCP connection on port 502. It prints success or the connection error, then closes the connection. It does not read PLC data in this single-target mode.
+
+**When `PING_ENABLED` is `true`, the Nano sends four ping requests to `PING_TARGET_IP`.** It prints a success or timeout for each request and a final packet count. A reply shows that the device is reachable over IP. Ping does not check any TCP port or read PLC data. Some devices block ping, so a timeout does not prove that the device is disconnected.
+
+**When `RS485_ENABLED` is `true`, the Nano scans for Modbus RTU devices through its RS-485 connection.** It uses the configured serial settings, device IDs, function code and register range. With `RS485_SCAN_ALL_SETTINGS` enabled, it tries the configured baud rates and parity/stop-bit combinations. It prints valid Modbus replies and any values returned. This mode uses the RS-485 wiring rather than an Ethernet IP address or TCP port.
+
+## Choosing the TCP addresses and ports
+
+`TCP_IP_PREFIX` supplies the first three parts of each address, such as `192.168.0.`. `TCP_LAST_OCTETS` supplies the last parts to try. For example, `"1-254"` checks the full range, `"2"` checks only address `192.168.0.2`, and `"2,10,20-25"` checks those selected addresses. These settings apply when `TCP_SCAN_IPS` is true and `TCP_AUTO_SUBNET` is false.
+
+If you set `TCP_AUTO_SUBNET` to true, the Nano calculates the IP range from its active network address and subnet mask instead. In that case, it ignores `TCP_IP_PREFIX` and `TCP_LAST_OCTETS`.
+
+`TCP_CUSTOM_PORTS` lists the ports to check during a scan, such as `"102,502"`. Keep `TCP_USE_COMMON_PORT` false to use that list. Setting `TCP_USE_COMMON_PORT` true overrides the list and checks only port 502. For a single-target test, use `TCP_TARGET_PORT` instead.
+
+`TCP_READ_MODBUS` controls whether an IP scan also attempts Modbus reads. With it false, the Nano only checks which TCP ports are open. With it true, the Nano sends Modbus read requests to open ports using the shared device-ID, function-code and register settings. Select ports that actually serve Modbus, usually 502. This flag does not enable S7 reads, and it has no effect on the single-target TCP test.
+
+## What happens after you select a mode
+
+Set the mode you want to true and the other three mode flags to false. A false mode flag means that mode will not run. For example, to scan TCP ports, set `TCP_ENABLED` true and set `S7_ENABLED`, `PING_ENABLED` and `RS485_ENABLED` false. Keep `TCP_SCAN_IPS` true and `TCP_READ_MODBUS` false for port checks only.
+
+The IP address in `ETH_STATIC_IP` belongs to the Nano, not the PLC. The current Nano address is `192.168.0.27/24`. S7 uses `S7_TARGET_IP`, ping uses `PING_TARGET_IP`, and the single-target TCP test uses `TCP_TARGET_IP`. Changing one target setting does not change the others.
+
+Network modes wait until a network connection is ready. S7, ping and the single-target TCP test run once; reset the Nano to repeat them. A TCP IP scan runs once and starts again when the selected network changes. The RS-485 scan runs once per boot. Results appear in the USB serial monitor at 115200 baud.
+
+After changing `main/scanner_config.h`, rebuild and flash the firmware. Editing the file alone does not change the firmware already running on the Nano.
+
 # ESP32-P4 Nano Modbus scanner
 
 Find responding Modbus endpoints and read raw register values using a Waveshare ESP32-P4 Nano. Choose **Modbus TCP over Ethernet/Wi-Fi** or **Modbus RTU over RS-485**.
 
 The board scans automatically. Results appear in the USB serial monitor with labeled TCP fields and a summary of responding unit IDs. Configuration is currently compiled into firmware: there is **no browser page or interactive terminal menu**. Edit [main/scanner_config.h](main/scanner_config.h), rebuild, and flash to change settings.
 
-Current configuration: **forced-static Ethernet at `10.24.26.253/24`**, scanning `10.24.26.1–254` with FC04. DHCP and candidate-subnet trials are bypassed. The mode examples below show how to change this configuration.
+Current configuration: **S7 read diagnostic with forced-static Ethernet at
+`192.168.0.27/24`**, targeting CPU `192.168.0.2`. DHCP and subnet scans are
+bypassed. The Modbus TCP scanner examples below require `TCP_ENABLED=true`,
+`TCP_SCAN_IPS=true` and `TCP_READ_MODBUS=true`, with the other modes false.
 
 ## Quick start
 
 1. Connect the Nano to your computer through its USB programming connector.
-2. For TCP, connect Ethernet to the device/network, or configure your Wi-Fi credentials. Leave `TCP_ENABLED` set to `true`.
-3. Leave `TCP_AUTO_SUBNET=true` to derive targets from the assigned IP and subnet mask. For direct Ethernet without DHCP, unknown-network mode tries the configured candidate subnets. See the discovery settings below.
+2. Select exactly one mode as explained above. For a network mode, connect Ethernet to the device/network, or configure Wi-Fi fallback. For RS-485, connect the serial wiring.
+3. Set the target for your chosen mode. For TCP scanning, choose a manual IP range or set `TCP_AUTO_SUBNET=true` to derive it from the network address and subnet mask.
 4. Build and flash using ESP-IDF **5.5.x**, target **esp32p4**.
-5. Open the serial monitor at **115200 baud**. Look for `Active network`, `READ OK`, and `FOUND` messages.
+5. Open the serial monitor at **115200 baud** to see the selected mode and its results. Port scans print `TCP OPEN`; Modbus scans print `READ OK` for successful reads.
 
 Scanning does not require the monitor to be open. TCP scans restart when the selected network changes, including after a completed scan. Multi-subnet mode also advances after each completed Ethernet subnet scan. With a stable network, a completed scan waits rather than repeating continuously. Reset the board to repeat manually. RTU performs one scan per boot.
 

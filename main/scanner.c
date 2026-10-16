@@ -107,9 +107,10 @@ static void worker(void *unused) {
     atomic_store(&busy,false); vTaskDelete(NULL);
 }
 void app_main(void) {
-    puts("Modbus automatic scanner. Settings: main/scanner_config.h. No terminal input required.");
-    if (TCP_ENABLED) {
-        puts("Mode: TCP. Ethernet first, Wi-Fi fallback if enabled; waiting for a network IP.");
+    puts(S7_ENABLED ? "Mode: S7 read." : TCP_ENABLED ? "Mode: TCP." :
+        PING_ENABLED ? "Mode: ping." : "Mode: RS-485.");
+    if (S7_ENABLED || TCP_ENABLED || PING_ENABLED) {
+        puts("Mode: network. Ethernet first, Wi-Fi fallback if enabled; waiting for a network IP.");
         tcp_scanner_start(&busy,&cancel_scan);
         return;
     }

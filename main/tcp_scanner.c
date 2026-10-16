@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "ping/ping_sock.h"
 #include "scanner_config.h"
 #include "esp_eth.h"
 #include "esp_wifi.h"
@@ -61,8 +62,8 @@ static void select_network(void) {
     selected_ip=current.ip.addr;selected_mask=current.netmask.addr;
     if(atomic_exchange(&preferred_network,selected)!=selected || address_changed) {
         atomic_fetch_add(&network_revision,1);
-        puts(selected==1?"Active network: Ethernet. TCP connections will use Ethernet.":
-            selected==2?"Active network: Wi-Fi fallback.":"No network IP; TCP scan will wait.");
+        puts(selected==1?"Active network: Ethernet.":
+            selected==2?"Active network: Wi-Fi fallback.":"No network IP; waiting.");
     }
 }
 static uint16_t transaction;
@@ -284,7 +285,7 @@ static int connect_peer(const char *ip,int port,int *socket_network) {
     if(fcntl(fd,F_SETFL,O_NONBLOCK)<0) {close(fd);return -1;}
     int r=connect(fd,(struct sockaddr *)&address,sizeof(address));
     if(r<0) {
-        if(errno!=EINPROGRESS || !wait_socket(fd,true,esp_timer_get_time()+tcp_config.timeout_ms*1000LL)) {close(fd);return -1;}
+        if(errno!=EINPROGRESS || !wait_socket(fd,true,esp_timer_get_time()+(TCP_READ_MODBUS?tcp_config.timeout_ms:TCP_CONNECT_TIMEOUT_MS)*1000LL)) {close(fd);return -1;}
         int err=0;socklen_t len=sizeof(err);
         if(getsockopt(fd,SOL_SOCKET,SO_ERROR,&err,&len)<0 || err) {close(fd);return -1;}
     }
@@ -361,10 +362,16 @@ scan_again:
         if(inet_pton(AF_INET,ip,&target_address)==1 && ntohl(target_address.s_addr)==self_ip) continue;
         checked++;
         if(checked==1 || checked%10==0)
-            printf("Scan progress: checking endpoint %u/%d | %u Modbus endpoints found\n",checked,no*np,endpoints);
+            printf("Scan progress: checking endpoint %u/%d | %u open endpoints found\n",checked,no*np,endpoints);
         int socket_network=0;
         int fd=connect_peer(ip,ports[p],&socket_network);
         if(fd<0) continue;
+        if(!TCP_READ_MODBUS) {
+            printf("TCP OPEN: %s:%d\n",ip,ports[p]);
+            endpoints++;
+            close(fd);
+            continue;
+        }
         printf("Port open: %s:%d | Checking unit IDs %d–%d...\n",ip,ports[p],job.id,job.last_id);
         bool responding_ids[256]={0};
         unsigned endpoint_replies=0;
@@ -403,6 +410,12 @@ scan_again:
             puts("\nResponding IDs do not necessarily represent separate physical devices.");
         } else puts("Port was open, but no valid Modbus reply was received for the configured reads.");
     }
+    if(!TCP_READ_MODBUS) {
+        printf("TCP PORT SCAN %s: %u endpoints checked, %u open.\n",
+            atomic_load(cancel)?"STOPPED":"COMPLETE",checked,endpoints);
+        puts("An open TCP port does not confirm application-protocol access.");
+        goto wait_for_change;
+    }
     printf("\nSCAN %s | %u Modbus endpoints | %u responding IP/port/unit combinations | %.1f seconds\n",
         atomic_load(cancel)?"STOPPED":"COMPLETE",endpoints,unit_responses,
         (esp_timer_get_time()-scan_started)/1000000.0);
@@ -421,6 +434,119 @@ wait_for_change:
     if(!atomic_load(cancel)) goto scan_again;
     vTaskDelete(NULL);
 }
+static void ping_success(esp_ping_handle_t ping, void *args) {
+    (void)args;
+    uint16_t seq=0;
+    uint32_t elapsed=0;
+    esp_ping_get_profile(ping,ESP_PING_PROF_SEQNO,&seq,sizeof(seq));
+    esp_ping_get_profile(ping,ESP_PING_PROF_TIMEGAP,&elapsed,sizeof(elapsed));
+    printf("PING SUCCESS: %s seq=%u time=%lu ms\n",PING_TARGET_IP,seq,(unsigned long)elapsed);
+}
+static void ping_timeout(esp_ping_handle_t ping, void *args) {
+    (void)args;
+    uint16_t seq=0;
+    esp_ping_get_profile(ping,ESP_PING_PROF_SEQNO,&seq,sizeof(seq));
+    printf("PING TIMEOUT: %s seq=%u\n",PING_TARGET_IP,seq);
+}
+static void ping_end(esp_ping_handle_t ping, void *args) {
+    (void)args;
+    uint32_t sent=0,received=0;
+    esp_ping_get_profile(ping,ESP_PING_PROF_REQUEST,&sent,sizeof(sent));
+    esp_ping_get_profile(ping,ESP_PING_PROF_REPLY,&received,sizeof(received));
+    printf("PING COMPLETE: %lu sent, %lu received. Reset to repeat.\n",
+        (unsigned long)sent,(unsigned long)received);
+    if(!received) puts("Some PLCs block ICMP; failed ping does not prove the PLC is unreachable.");
+    esp_ping_delete_session(ping);
+    atomic_store(busy,false);
+}
+static void ping_plc(void) {
+    esp_ping_config_t config=ESP_PING_DEFAULT_CONFIG();
+    if(!ipaddr_aton(PING_TARGET_IP,&config.target_addr)) {
+        puts("Invalid PLC ping address.");atomic_store(busy,false);return;
+    }
+    config.count=4;
+    config.interval_ms=1000;
+    config.timeout_ms=1000;
+    esp_netif_t *selected=atomic_load(&preferred_network)==1?netif:wifi_netif;
+    int index=selected?esp_netif_get_netif_impl_index(selected):-1;
+    if(index<=0) {
+        puts("Cannot select ping network interface.");atomic_store(busy,false);return;
+    }
+    config.interface=(uint32_t)index;
+    esp_ping_callbacks_t callbacks={.on_ping_success=ping_success,
+        .on_ping_timeout=ping_timeout,.on_ping_end=ping_end};
+    esp_ping_handle_t ping=NULL;
+    printf("Pinging %s: 4 requests, interval 1000 ms, timeout 1000 ms\n",PING_TARGET_IP);
+    esp_err_t err=esp_ping_new_session(&config,&callbacks,&ping);
+    if(err==ESP_OK) {
+        err=esp_ping_start(ping);
+        if(err!=ESP_OK) esp_ping_delete_session(ping);
+    }
+    if(err!=ESP_OK) {
+        printf("Cannot start PLC ping: %s\n",esp_err_to_name(err));
+        atomic_store(busy,false);
+    }
+}
+extern void s7_settimino_test(const char *target,esp_netif_t *netif);
+static void test_plc_port(void) {
+    int sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+    int error=0;
+    if(sock<0) {
+        error=errno;
+        printf("TCP socket error=%d (%s)\n",error,strerror(error));
+        return;
+    }
+    struct sockaddr_in destination={.sin_family=AF_INET,.sin_port=htons(TCP_TARGET_PORT)};
+    if(inet_pton(AF_INET,TCP_TARGET_IP,&destination.sin_addr)!=1) {
+        puts("Invalid PLC address.");close(sock);return;
+    }
+    esp_netif_t *selected=atomic_load(&preferred_network)==1?netif:wifi_netif;
+    struct ifreq iface={0};
+    if(!selected || esp_netif_get_netif_impl_name(selected,iface.ifr_name)!=ESP_OK) {
+        puts("Cannot select TCP test interface.");close(sock);return;
+    }
+    if(setsockopt(sock,SOL_SOCKET,SO_BINDTODEVICE,&iface,sizeof(iface))<0 ||
+       fcntl(sock,F_SETFL,O_NONBLOCK)<0) {
+        error=errno;
+        printf("TCP socket setup error=%d (%s)\n",error,strerror(error));
+        close(sock);return;
+    }
+    printf("Testing TCP %s:%d (connect timeout %d ms)\n",
+        TCP_TARGET_IP,TCP_TARGET_PORT,TCP_CONNECT_TIMEOUT_MS);
+    int64_t deadline=esp_timer_get_time()+TCP_CONNECT_TIMEOUT_MS*1000LL;
+    int result=connect(sock,(struct sockaddr *)&destination,sizeof(destination));
+    if(result<0) {
+        error=errno;
+        if(error==EINPROGRESS) {
+            for(;;) {
+                int64_t remaining=deadline-esp_timer_get_time();
+                if(remaining<=0) {error=ETIMEDOUT;break;}
+                fd_set write_fds,error_fds;
+                FD_ZERO(&write_fds);FD_SET(sock,&write_fds);
+                FD_ZERO(&error_fds);FD_SET(sock,&error_fds);
+                struct timeval timeout={.tv_sec=remaining/1000000,.tv_usec=remaining%1000000};
+                int ready=select(sock+1,NULL,&write_fds,&error_fds,&timeout);
+                if(ready<0) {error=errno;if(error==EINTR) continue;break;}
+                if(ready==0) {error=ETIMEDOUT;break;}
+                socklen_t size=sizeof(error);
+                if(getsockopt(sock,SOL_SOCKET,SO_ERROR,&error,&size)<0) error=errno;
+                break;
+            }
+        }
+    }
+    if(!error) {
+        printf("SUCCESS: TCP port %d accepts connections.\n",TCP_TARGET_PORT);
+
+    }
+    else {
+        printf("TCP connect error=%d (%s)\n",error,strerror(error));
+        if(error==ECONNRESET) puts("Connection reset by peer; check PLC service, client limits and access restrictions.");
+        else if(error==ECONNREFUSED) puts("Connection refused; port may be closed or actively rejected.");
+        else if(error==ETIMEDOUT) puts("Connection timed out; no TCP response within 3 seconds. Filtering or packet loss is possible.");
+    }
+    close(sock);
+    puts("TCP test complete. Reset to repeat.");
+}
 static void automatic_scan(void *unused) {
     (void)unused;
     unsigned waits=0;
@@ -434,11 +560,38 @@ static void automatic_scan(void *unused) {
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    puts("Network ready. Starting configured TCP scan.");
+    if(S7_ENABLED) {
+        s7_settimino_test(S7_TARGET_IP,atomic_load(&preferred_network)==1?netif:wifi_netif);
+        atomic_store(busy,false);
+        vTaskDelete(NULL);
+        return;
+    }
+    if((TCP_ENABLED && !TCP_SCAN_IPS)) {
+        test_plc_port();
+        atomic_store(busy,false);
+        vTaskDelete(NULL);
+        return;
+    }
+    if(PING_ENABLED) {
+        ping_plc();
+        vTaskDelete(NULL);
+        return;
+    }
+    puts(TCP_READ_MODBUS?"Network ready. Starting Modbus TCP scan.":
+        "Network ready. Starting TCP IP/port scan.");
     worker(NULL); // Scans again whenever the selected network changes.
 }
 void tcp_scanner_start(atomic_bool *b,atomic_bool *c) {
     busy=b;cancel=c;
+    if(TCP_ENABLED && (TCP_CONNECT_TIMEOUT_MS<20 || TCP_CONNECT_TIMEOUT_MS>10000 ||
+       (!TCP_SCAN_IPS && (TCP_TARGET_PORT<1 || TCP_TARGET_PORT>65535)))) {
+        puts("Invalid TCP port or connection timeout.");return;
+    }
+    if(S7_ENABLED && (S7_RACK<0 || S7_RACK>7 || S7_SLOT<0 || S7_SLOT>31 ||
+       S7_INPUT_BYTE<0 || S7_INPUT_BYTE>65535)) {
+        puts("Invalid S7 rack, slot or input byte.");return;
+    }
+
     if(TCP_AUTO_MAX_HOSTS<2 || TCP_AUTO_MAX_HOSTS>65534 ||
        (ETH_UNKNOWN_NETWORK_ENABLED && !ETH_STATIC_FALLBACK_ENABLED)) {
         puts("Invalid automatic discovery settings; scan not started.");return;
@@ -465,23 +618,29 @@ void tcp_scanner_start(atomic_bool *b,atomic_bool *c) {
         memcpy(static_scan_prefix,ETH_STATIC_IP,prefix_len);
         static_scan_prefix[prefix_len]=0;
     }
-    job=(tcp_job_t){.scan=true,.id=SCAN_FIRST_ID,.last_id=SCAN_LAST_ID,
-        .fc=SCAN_FUNCTION_CODE,.start=SCAN_START_REGISTER,.end=SCAN_LAST_START_REGISTER,
-        .count=SCAN_REGISTER_COUNT,.step=SCAN_REGISTER_STEP};
-    uint8_t request[12];int octets[254],ports[32];
-    if(job.id<0 || job.last_id<job.id || job.last_id>255 || job.end<job.start || job.end>65535 ||
-       job.step<1 || job.step>65535 || job.count>65536-job.end ||
-       !mb_tcp_request(request,0,job.id,job.fc,job.start,job.count) ||
-       !tcp_prefix_valid(tcp_config.ip_prefix) ||
-       (ETH_STATIC_FALLBACK_ENABLED && (!tcp_prefix_valid(static_scan_prefix) || ETH_DHCP_TIMEOUT_SECONDS<1)) ||
-       tcp_parse_list(tcp_config.last_octets,1,254,octets,254)<1 ||
-       (!tcp_config.use_common_port && tcp_parse_list(tcp_config.custom_ports,1,65535,ports,32)<1) ||
-       tcp_config.timeout_ms<20 || tcp_config.timeout_ms>10000) {
-        puts("Invalid TCP settings in scanner_config.h; scan not started.");return;
+    if(TCP_ENABLED && TCP_SCAN_IPS) {
+        printf("TCP scan: %s | IP range %s%s | ports %s\n",
+            TCP_READ_MODBUS?"Modbus reads":"port checks only",
+            TCP_AUTO_SUBNET?"automatic subnet":"",TCP_AUTO_SUBNET?"":TCP_IP_PREFIX TCP_LAST_OCTETS,
+            TCP_USE_COMMON_PORT?"502":TCP_CUSTOM_PORTS);
+        job=(tcp_job_t){.scan=true,.id=SCAN_FIRST_ID,.last_id=SCAN_LAST_ID,
+            .fc=SCAN_FUNCTION_CODE,.start=SCAN_START_REGISTER,.end=SCAN_LAST_START_REGISTER,
+            .count=SCAN_REGISTER_COUNT,.step=SCAN_REGISTER_STEP};
+        uint8_t request[12];int octets[254],ports[32];
+        if(job.id<0 || job.last_id<job.id || job.last_id>255 || job.end<job.start || job.end>65535 ||
+           job.step<1 || job.step>65535 || job.count>65536-job.end ||
+           !mb_tcp_request(request,0,job.id,job.fc,job.start,job.count) ||
+           !tcp_prefix_valid(tcp_config.ip_prefix) ||
+           (ETH_STATIC_FALLBACK_ENABLED && (!tcp_prefix_valid(static_scan_prefix) || ETH_DHCP_TIMEOUT_SECONDS<1)) ||
+           tcp_parse_list(tcp_config.last_octets,1,254,octets,254)<1 ||
+           (!tcp_config.use_common_port && tcp_parse_list(tcp_config.custom_ports,1,65535,ports,32)<1) ||
+           tcp_config.timeout_ms<20 || tcp_config.timeout_ms>10000) {
+            puts("Invalid TCP settings in scanner_config.h; scan not started.");return;
+        }
+        printf("TCP targets: %s, ports=%s, IDs=%d..%d, FC=%d, starts=%d..%d, count=%d\n",
+            TCP_AUTO_SUBNET?"automatic from interface IP/netmask":"manual (scanner_config.h)",tcp_config.use_common_port?"502":tcp_config.custom_ports,
+            job.id,job.last_id,job.fc,job.start,job.end,job.count);
     }
-    printf("TCP targets: %s, ports=%s, IDs=%d..%d, FC=%d, starts=%d..%d, count=%d\n",
-        TCP_AUTO_SUBNET?"automatic from interface IP/netmask":"manual (scanner_config.h)",tcp_config.use_common_port?"502":tcp_config.custom_ports,
-        job.id,job.last_id,job.fc,job.start,job.end,job.count);
     if(start_ethernet()!=0 && !WIFI_FALLBACK_ENABLED) return;
     if(xTaskCreate(network_monitor,"network_monitor",8192,NULL,5,NULL)!=pdPASS) {
         puts("Cannot start network fallback monitor.");return;

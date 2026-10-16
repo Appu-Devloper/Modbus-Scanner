@@ -3,7 +3,33 @@
 /* All settings are compiled into firmware. Rebuild and flash after editing.
  * Automatic scan on boot and selected-network changes; reset to repeat manually.
  */
-#define TCP_ENABLED true
+/* Choose exactly ONE mode. Rebuild and flash after changing these flags. */
+#define S7_ENABLED true
+#define TCP_ENABLED false
+#define PING_ENABLED false
+#define RS485_ENABLED false
+
+#if (S7_ENABLED + TCP_ENABLED + PING_ENABLED + RS485_ENABLED) != 1
+#error "Enable exactly one mode: S7_ENABLED, TCP_ENABLED, PING_ENABLED or RS485_ENABLED"
+#endif
+
+/* S7 read: CPU IP, rack/slot, and one input byte (0 means IB0).
+ * S7 uses TCP port 102. */
+#define S7_TARGET_IP "192.168.0.2"
+#define S7_RACK 0
+#define S7_SLOT 1
+#define S7_INPUT_BYTE 0
+
+/* Ping: four requests to this one address. */
+#define PING_TARGET_IP "192.168.0.2"
+
+/* TCP: true scans the IP range/ports below; false tests one IP/port. */
+#define TCP_SCAN_IPS true
+#define TCP_TARGET_IP "192.168.0.2"
+#define TCP_TARGET_PORT 502
+#define TCP_CONNECT_TIMEOUT_MS 3000
+/* Optional Modbus reads during IP scanning. false = TCP port checks only. */
+#define TCP_READ_MODBUS false
 
 /* Shared read request / scan range (inclusive, zero-based register offsets).
  * To read one device/block, set FIRST_ID=LAST_ID and START=LAST_START.
@@ -20,12 +46,12 @@
 /* TCP target selection. true selects only 502; false uses CUSTOM_PORTS. */
 /* Auto mode derives the full subnet from the selected interface's IP/mask.
  * Manual mode uses TCP_IP_PREFIX and TCP_LAST_OCTETS as before. */
-#define TCP_AUTO_SUBNET true
+#define TCP_AUTO_SUBNET false
 #define TCP_AUTO_MAX_HOSTS 1024
-#define TCP_IP_PREFIX "10.9.9."
+#define TCP_IP_PREFIX "192.168.0."
 #define TCP_LAST_OCTETS "1-254"
-#define TCP_USE_COMMON_PORT true
-#define TCP_CUSTOM_PORTS "502,1502,2502"
+#define TCP_USE_COMMON_PORT false
+#define TCP_CUSTOM_PORTS "102,502"
 #define TCP_TIMEOUT_MS 500
 
 /* Ethernet: DHCP first, then static address while link remains connected. */
@@ -36,9 +62,9 @@
 #define ETH_STATIC_FALLBACK_ENABLED true
 #define ETH_DHCP_TIMEOUT_SECONDS 10
 /* Nano address for the PLC LAN; must be unused. Auto scan uses this subnet. */
-#define ETH_STATIC_IP "10.9.9.57"
+#define ETH_STATIC_IP "192.168.0.27"
 #define ETH_STATIC_NETMASK "255.255.255.0"
-#define ETH_STATIC_GATEWAY "10.9.9.1"
+#define ETH_STATIC_GATEWAY "0.0.0.0"
 
 /* Unknown direct Ethernet: try these /24 scanner addresses after DHCP fails.
  * Addresses must be unused. Disable to use ETH_STATIC_IP only.
